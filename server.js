@@ -1,168 +1,327 @@
 'use strict';
-/* My Website server: serves public/BrineMC.html and shares skins between all devices.
-   No dependencies. Run:  node server.js   (Node 18+)  */
-const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
+const express = require('express');
+const cookieParser = require('cookie-parser');
+const Database = require('better-sqlite3');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
-const PORT = +process.env.PORT || 3000;
-const PUB = path.join(__dirname, 'public');
-const DATA = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
+const PORT = process.env.PORT || 3000;
+const PROD = process.env.NODE_ENV === 'production';
+const DATA = process.env.DATA_DIR || path.join(__dirname, 'data');
 const SKIN_DIR = path.join(DATA, 'skins');
-const TRUST_PROXY = process.env.TRUST_PROXY === '1';
-/* sites allowed to call the API through a proxy (e.g. your Netlify address) */
-const ALLOWED = (process.env.ALLOWED_ORIGINS || '').split(',').map(x => x.trim()).filter(Boolean)
-  .map(x => { try { return new URL(x).host; } catch (e) { return x; } });
-fs.mkdirSync(SKIN_DIR, { recursive: true });
+const CAPE_DIR = path.join(DATA, 'capes');
+const SCH_DIR = path.join(DATA, 'schematics');
+[SKIN_DIR, CAPE_DIR, SCH_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
 
-const DB_FILE = path.join(DATA, 'db.json');
-let db = { users: {}, sessions: {}, skins: [] };
-try { db = Object.assign(db, JSON.parse(fs.readFileSync(DB_FILE, 'utf8'))); } catch (e) {}
-function save() {
-  const tmp = DB_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(db));
-  fs.renameSync(tmp, DB_FILE);
-}
+const db = new Database(path.join(DATA, 'brinemc.db'));
+db.pragma('journal_mode = WAL');
+db.exec(`
+CREATE TABLE IF NOT EXISTS users(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  nickname TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  salt TEXT NOT NULL,
+  hash TEXT NOT NULL,
+  created INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions(
+  token TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS capes(
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  created INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS schematics(
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  thumb_ext TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  created INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS skins(
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  created INTEGER NOT NULL
+);
+`);
 
-const MAX_BODY = 300 * 1024, MAX_PNG = 100 * 1024, MAX_SKINS_PER_USER = 100, MAX_SKINS_TOTAL = 5000;
-const SESSION_MS = 30 * 864e5;
+const app = express();
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+app.use('/api/schematics', express.json({ limit: '17mb' }));
+app.use(express.json({ limit: '300kb' }));
+app.use(cookieParser());
 
-/* ---------- helpers ---------- */
-const sha = s => crypto.createHash('sha256').update(s).digest('hex');
-function hashPw(pw, salt) { return crypto.scryptSync(pw, salt, 64).toString('hex'); }
-function send(res, code, obj, headers) {
-  const body = JSON.stringify(obj === undefined ? {} : obj);
-  res.writeHead(code, Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }, headers));
-  res.end(body);
-}
-function ip(req) {
-  if (TRUST_PROXY && req.headers['x-nf-client-connection-ip']) return String(req.headers['x-nf-client-connection-ip']).trim();
-  if (TRUST_PROXY && req.headers['x-forwarded-for']) return String(req.headers['x-forwarded-for']).split(',')[0].trim();
-  return req.socket.remoteAddress || '?';
-}
+/* ---- security headers ---- */
+app.use((req, res, next) => {
+  res.set({
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'SAMEORIGIN',
+    'Referrer-Policy': 'same-origin',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+  });
+  if (PROD) res.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
+
+/* ---- tiny rate limiter (per IP + bucket) ---- */
 const hits = new Map();
-function limited(key, max, windowMs) {
-  const now = Date.now(), a = (hits.get(key) || []).filter(t => now - t < windowMs);
-  if (a.length >= max) { hits.set(key, a); return true; }
-  a.push(now); hits.set(key, a); return false;
+function limit(bucket, max, windowMs) {
+  return (req, res, next) => {
+    const k = bucket + ':' + req.ip, now = Date.now();
+    const a = (hits.get(k) || []).filter(t => now - t < windowMs);
+    if (a.length >= max) return res.status(429).json({ error: 'rate' });
+    a.push(now); hits.set(k, a); next();
+  };
 }
-setInterval(() => { const now = Date.now(); for (const [k, a] of hits) if (!a.some(t => now - t < 36e5)) hits.delete(k);
-  for (const [k, s] of Object.entries(db.sessions)) if (s.exp < now) delete db.sessions[k]; }, 6e5).unref();
+setInterval(() => { const now = Date.now(); for (const [k, a] of hits) if (!a.some(t => now - t < 3600e3)) hits.delete(k); }, 600e3).unref();
 
-function cookies(req) {
-  const o = {}; String(req.headers.cookie || '').split(';').forEach(p => { const i = p.indexOf('='); if (i > 0) o[p.slice(0, i).trim()] = p.slice(i + 1).trim(); });
-  return o;
+/* ---- helpers ---- */
+const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/;
+const NICK_RE = /^[A-Za-z0-9_]{3,16}$/;
+const RESERVED = new Set(['admin', 'administrator', 'moderator', 'mod', 'staff', 'support', 'brinemc', 'system', 'root', 'null', 'undefined', 'guest', 'anonymous']);
+
+function hashPw(pw, salt) { return crypto.scryptSync(pw, salt, 64).toString('hex'); }
+function safeEq(a, b) { const x = Buffer.from(a, 'hex'), y = Buffer.from(b, 'hex'); return x.length === y.length && crypto.timingSafeEqual(x, y); }
+
+function startSession(res, userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const maxAge = 30 * 864e5;
+  db.prepare('INSERT INTO sessions(token,user_id,expires) VALUES(?,?,?)').run(token, userId, Date.now() + maxAge);
+  res.cookie('sid', token, { httpOnly: true, sameSite: 'lax', secure: PROD, maxAge, path: '/' });
 }
-function sessionEmail(req) {
-  const t = cookies(req).mw_sid; if (!t) return null;
-  const s = db.sessions[sha(t)]; if (!s || s.exp < Date.now()) return null;
-  return s.email;
+function currentUser(req) {
+  const t = req.cookies && req.cookies.sid;
+  if (!t || typeof t !== 'string') return null;
+  const row = db.prepare('SELECT u.id,u.email,u.nickname,s.expires FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?').get(t);
+  if (!row) return null;
+  if (row.expires < Date.now()) { db.prepare('DELETE FROM sessions WHERE token=?').run(t); return null; }
+  return row;
 }
-function secure(req) { return !!req.socket.encrypted || (TRUST_PROXY && req.headers['x-forwarded-proto'] === 'https'); }
-function startSession(req, res, email) {
-  const t = crypto.randomBytes(32).toString('hex');
-  db.sessions[sha(t)] = { email, exp: Date.now() + SESSION_MS }; save();
-  return 'mw_sid=' + t + '; HttpOnly; SameSite=Lax; Path=/; Max-Age=' + (SESSION_MS / 1000) + (secure(req) ? '; Secure' : '');
+function needUser(req, res, next) {
+  const u = currentUser(req);
+  if (!u) return res.status(401).json({ error: 'auth' });
+  req.user = u; next();
 }
-function readJson(req) {
-  return new Promise((ok, no) => {
-    let n = 0; const ch = [];
-    req.on('data', c => { n += c.length; if (n > MAX_BODY) { no(413); req.destroy(); } else ch.push(c); });
-    req.on('end', () => { if (!n) return ok({}); try { const j = JSON.parse(Buffer.concat(ch).toString('utf8')); ok(j && typeof j === 'object' ? j : {}); } catch (e) { no(400); } });
-    req.on('error', () => no(400));
-  });
-}
-const validEmail = e => typeof e === 'string' && e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+/* CSRF: state-changing requests must come from our own origin */
+app.use((req, res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD') return next();
+  const o = req.get('origin');
+  if (o) { try { if (new URL(o).host !== req.get('host')) return res.status(403).json({ error: 'origin' }); } catch (e) { return res.status(403).json({ error: 'origin' }); } }
+  next();
+});
+function nickOk(n) { return typeof n === 'string' && NICK_RE.test(n) && !RESERVED.has(n.toLowerCase()); }
 
-/* ---------- API ---------- */
-async function api(req, res, url) {
-  const p = url.pathname;
-  if (req.method === 'POST') {            /* block cross-site posts */
-    const o = req.headers.origin;
-    if (o) { try { const oh = new URL(o).host; if (oh !== req.headers.host && !ALLOWED.includes(oh)) return send(res, 403, { error: 'origin' }); } catch (e) { return send(res, 403, { error: 'origin' }); } }
-  }
-  if (p === '/api/skins' && req.method === 'GET') {
-    const me = sessionEmail(req);
-    return send(res, 200, db.skins.slice().sort((a, b) => b.created - a.created).map(s => ({ id: s.id, name: s.name, created: s.created, mine: !!me && s.email === me })));
-  }
-  if (p === '/api/me' && req.method === 'GET') {
-    const me = sessionEmail(req); return me ? send(res, 200, { email: me }) : send(res, 401, { error: 'signed out' });
-  }
-  if (req.method !== 'POST') return send(res, 404, { error: 'not found' });
+/* ---- auth ---- */
+app.get('/api/nickname-check', limit('nick', 60, 60e3), (req, res) => {
+  const n = String(req.query.nickname || '').trim();
+  if (!NICK_RE.test(n)) return res.json({ valid: false, available: false, reason: 'format' });
+  if (RESERVED.has(n.toLowerCase())) return res.json({ valid: false, available: false, reason: 'reserved' });
+  const taken = !!db.prepare('SELECT 1 FROM users WHERE nickname=?').get(n);
+  res.json({ valid: true, available: !taken });
+});
 
-  let body; try { body = await readJson(req); } catch (c) { return send(res, c === 413 ? 413 : 400, { error: 'bad body' }); }
+app.post('/api/signup', limit('signup', 10, 3600e3), (req, res) => {
+  const { email, password, nickname } = req.body || {};
+  const e = typeof email === 'string' ? email.trim() : '';
+  const n = typeof nickname === 'string' ? nickname.trim() : '';
+  if (!EMAIL_RE.test(e) || typeof password !== 'string' || password.length < 8 || password.length > 200 || !nickOk(n))
+    return res.status(400).json({ error: 'invalid' });
+  if (db.prepare('SELECT 1 FROM users WHERE nickname=?').get(n)) return res.status(409).json({ error: 'nickname' });
+  if (db.prepare('SELECT 1 FROM users WHERE email=?').get(e)) return res.status(409).json({ error: 'email' });
+  const salt = crypto.randomBytes(16).toString('hex');
+  try {
+    const r = db.prepare('INSERT INTO users(email,nickname,salt,hash,created) VALUES(?,?,?,?,?)').run(e, n, salt, hashPw(password, salt), Date.now());
+    startSession(res, r.lastInsertRowid);
+    res.json({ ok: true, email: e, nickname: n });
+  } catch (err) { /* race: UNIQUE constraint is the final guard */
+    const m = String(err.message);
+    res.status(409).json({ error: /nickname/i.test(m) ? 'nickname' : 'email' });
+  }
+});
 
-  if (p === '/api/signup' || p === '/api/signin') {
-    if (limited('auth:' + ip(req), 20, 15 * 6e4)) return send(res, 429, { error: 'too many attempts' });
-    const email = String(body.email || '').trim().toLowerCase(), pw = body.password;
-    if (!validEmail(email) || typeof pw !== 'string' || pw.length < (p === '/api/signup' ? 8 : 1) || pw.length > 200) return send(res, 400, { error: 'invalid' });
-    if (p === '/api/signup') {
-      if (db.users[email]) return send(res, 409, { error: 'exists' });
-      const salt = crypto.randomBytes(16).toString('hex');
-      db.users[email] = { salt, hash: hashPw(pw, salt), created: Date.now() };
-      return send(res, 200, { email }, { 'Set-Cookie': startSession(req, res, email) });
-    }
-    const u = db.users[email], salt = u ? u.salt : 'x'.repeat(32), h = Buffer.from(hashPw(pw, salt), 'hex');
-    const good = u && crypto.timingSafeEqual(h, Buffer.from(u.hash, 'hex'));
-    if (!good) return send(res, 401, { error: 'wrong' });
-    return send(res, 200, { email }, { 'Set-Cookie': startSession(req, res, email) });
-  }
-  if (p === '/api/signout') {
-    const t = cookies(req).mw_sid; if (t) { delete db.sessions[sha(t)]; save(); }
-    return send(res, 200, {}, { 'Set-Cookie': 'mw_sid=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0' });
-  }
-  if (p === '/api/request-reset') return send(res, 501, { error: 'email sending is not configured' });
+app.post('/api/signin', limit('signin', 20, 15 * 60e3), (req, res) => {
+  const { email, nickname, identifier, password } = req.body || {};
+  const id = String(identifier || email || nickname || '').trim();
+  if (!id || typeof password !== 'string' || password.length > 200) return res.status(400).json({ error: 'invalid' });
+  const u = db.prepare('SELECT * FROM users WHERE email=? OR nickname=?').get(id, id);
+  const salt = u ? u.salt : 'x'.repeat(32);
+  const h = hashPw(password, salt); /* same work whether or not the user exists */
+  if (!u || !safeEq(h, u.hash)) return res.status(401).json({ error: 'credentials' });
+  startSession(res, u.id);
+  res.json({ ok: true, email: u.email, nickname: u.nickname });
+});
 
-  if (p === '/api/skins') {
-    const me = sessionEmail(req); if (!me) return send(res, 401, { error: 'sign in' });
-    if (limited('up:' + me, 20, 36e5)) return send(res, 429, { error: 'too many uploads' });
-    const name = String(body.name || '').replace(/[^\w \-]/g, '').trim().slice(0, 16);
-    const m = /^data:image\/png;base64,([A-Za-z0-9+/=]+)$/.exec(String(body.png || ''));
-    if (!name || !m) return send(res, 400, { error: 'invalid' });
-    const png = Buffer.from(m[1], 'base64');
-    if (png.length < 33 || png.length > MAX_PNG || png.readUInt32BE(0) !== 0x89504e47 || png.readUInt32BE(4) !== 0x0d0a1a0a ||
-        png.toString('latin1', 12, 16) !== 'IHDR' || png.readUInt32BE(16) !== 64 || png.readUInt32BE(20) !== 64) return send(res, 400, { error: 'must be a 64x64 png' });
-    if (db.skins.length >= MAX_SKINS_TOTAL || db.skins.filter(s => s.email === me).length >= MAX_SKINS_PER_USER) return send(res, 429, { error: 'limit reached' });
-    const id = crypto.randomBytes(8).toString('hex');
-    fs.writeFileSync(path.join(SKIN_DIR, id + '.png'), png);
-    db.skins.push({ id, name, email: me, created: Date.now() }); save();
-    return send(res, 201, { id });
-  }
-  if (p === '/api/skins/delete') {
-    const me = sessionEmail(req); if (!me) return send(res, 401, { error: 'sign in' });
-    const i = db.skins.findIndex(s => s.id === body.id);
-    if (i < 0) return send(res, 404, { error: 'not found' });
-    if (db.skins[i].email !== me) return send(res, 403, { error: 'not yours' });
-    const id = db.skins[i].id; db.skins.splice(i, 1); save();
-    fs.unlink(path.join(SKIN_DIR, id + '.png'), () => {});
-    return send(res, 200, {});
-  }
-  send(res, 404, { error: 'not found' });
-}
+app.post('/api/signout', (req, res) => {
+  const t = req.cookies && req.cookies.sid;
+  if (t) db.prepare('DELETE FROM sessions WHERE token=?').run(String(t));
+  res.clearCookie('sid', { path: '/' });
+  res.json({ ok: true });
+});
 
-/* ---------- static files ---------- */
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.json': 'application/json', '.ico': 'image/x-icon', '.glb': 'model/gltf-binary', '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.woff2': 'font/woff2' };
-function serve(req, res, url) {
-  let p; try { p = decodeURIComponent(url.pathname); } catch (e) { res.writeHead(400); return res.end(); }
-  const m = /^\/skins\/([a-f0-9]{16})\.png$/.exec(p);
-  let file;
-  if (m) file = path.join(SKIN_DIR, m[1] + '.png');
-  else {
-    if (p === '/') p = '/BrineMC.html';
-    file = path.join(PUB, p);
-    if (file !== PUB && !file.startsWith(PUB + path.sep)) { res.writeHead(403); return res.end(); }
-  }
-  fs.stat(file, (err, st) => {
-    if (err || !st.isFile()) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('Not found'); }
-    const h = { 'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream', 'Content-Length': st.size, 'X-Content-Type-Options': 'nosniff' };
-    h['Cache-Control'] = m ? 'public, max-age=31536000, immutable' : 'no-cache';
-    res.writeHead(200, h);
-    if (req.method === 'HEAD') return res.end();
-    fs.createReadStream(file).pipe(res);
-  });
+app.get('/api/me', (req, res) => {
+  const u = currentUser(req);
+  if (!u) return res.status(401).json({ error: 'auth' });
+  res.json({ email: u.email, nickname: u.nickname });
+});
+
+/* password reset needs an email provider: not configured yet */
+app.post('/api/request-reset', limit('reset', 5, 3600e3), (req, res) => res.status(501).json({ error: 'not-configured' }));
+
+/* ---- skins (shared with everyone, owned by the uploader) ---- */
+const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+function validSkinPng(buf) {
+  if (buf.length < 33 || buf.length > 200 * 1024 || !buf.subarray(0, 8).equals(PNG_SIG)) return false;
+  if (buf.toString('ascii', 12, 16) !== 'IHDR') return false;
+  const w = buf.readUInt32BE(16), h = buf.readUInt32BE(20);
+  return w === 64 && (h === 64 || h === 32);
 }
 
-http.createServer((req, res) => {
-  const url = new URL(req.url, 'http://x');
-  if (url.pathname.startsWith('/api/')) api(req, res, url).catch(e => { console.error(e); if (!res.headersSent) send(res, 500, { error: 'server' }); });
-  else if (req.method === 'GET' || req.method === 'HEAD') serve(req, res, url);
-  else { res.writeHead(405); res.end(); }
-}).listen(PORT, () => console.log('My Website running on http://localhost:' + PORT));
+app.get('/api/skins', (req, res) => {
+  const me = currentUser(req);
+  const rows = db.prepare('SELECT s.id,s.name,s.created,s.user_id,u.nickname FROM skins s JOIN users u ON u.id=s.user_id ORDER BY s.created DESC').all();
+  res.set('Cache-Control', 'no-store');
+  res.json(rows.map(r => ({ id: r.id, name: r.name, created: r.created, by: r.nickname, mine: !!me && me.id === r.user_id })));
+});
+
+app.post('/api/skins', limit('skin', 20, 3600e3), needUser, (req, res) => {
+  const { name, png } = req.body || {};
+  const nm = typeof name === 'string' ? name.replace(/[^\w \-]/g, '').trim().slice(0, 16) : '';
+  const m = typeof png === 'string' && /^data:image\/png;base64,([A-Za-z0-9+/=]+)$/.exec(png);
+  if (!nm || !m) return res.status(400).json({ error: 'invalid' });
+  const buf = Buffer.from(m[1], 'base64');
+  if (!validSkinPng(buf)) return res.status(400).json({ error: 'png' });
+  const n = db.prepare('SELECT COUNT(*) c FROM skins WHERE user_id=?').get(req.user.id).c;
+  if (n >= 100) return res.status(429).json({ error: 'quota' });
+  const id = crypto.randomBytes(8).toString('hex');
+  fs.writeFileSync(path.join(SKIN_DIR, id + '.png'), buf);
+  db.prepare('INSERT INTO skins(id,user_id,name,created) VALUES(?,?,?,?)').run(id, req.user.id, nm, Date.now());
+  res.json({ ok: true, id });
+});
+
+app.post('/api/skins/delete', needUser, (req, res) => {
+  const id = String((req.body || {}).id || '');
+  if (!/^[0-9a-f]{16}$/.test(id)) return res.status(400).json({ error: 'invalid' });
+  const r = db.prepare('DELETE FROM skins WHERE id=? AND user_id=?').run(id, req.user.id);
+  if (r.changes) fs.rmSync(path.join(SKIN_DIR, id + '.png'), { force: true });
+  res.json({ ok: r.changes > 0 });
+});
+
+app.get('/skins/:id.png', (req, res) => {
+  if (!/^[0-9a-f]{16}$/.test(req.params.id)) return res.sendStatus(404);
+  const f = path.join(SKIN_DIR, req.params.id + '.png');
+  if (!fs.existsSync(f)) return res.sendStatus(404);
+  res.set('Content-Type', 'image/png').set('Cache-Control', 'public, max-age=31536000, immutable').sendFile(f);
+});
+
+/* ---- capes (shared with everyone, owned by the uploader) ---- */
+function validCapePng(buf) {
+  if (buf.length < 33 || buf.length > 100 * 1024 || !buf.subarray(0, 8).equals(PNG_SIG)) return false;
+  if (buf.toString('ascii', 12, 16) !== 'IHDR') return false;
+  return buf.readUInt32BE(16) === 64 && buf.readUInt32BE(20) === 32;
+}
+app.get('/api/capes', (req, res) => {
+  const me = currentUser(req);
+  const rows = db.prepare('SELECT c.id,c.name,c.created,c.user_id,u.nickname FROM capes c JOIN users u ON u.id=c.user_id ORDER BY c.created DESC').all();
+  res.set('Cache-Control', 'no-store');
+  res.json(rows.map(r => ({ id: r.id, name: r.name, created: r.created, by: r.nickname, mine: !!me && me.id === r.user_id })));
+});
+app.post('/api/capes', limit('cape', 20, 3600e3), needUser, (req, res) => {
+  const { name, png } = req.body || {};
+  const nm = typeof name === 'string' ? name.replace(/[^\w \-]/g, '').trim().slice(0, 20) : '';
+  const m = typeof png === 'string' && /^data:image\/png;base64,([A-Za-z0-9+/=]+)$/.exec(png);
+  if (!nm || !m) return res.status(400).json({ error: 'invalid' });
+  const buf = Buffer.from(m[1], 'base64');
+  if (!validCapePng(buf)) return res.status(400).json({ error: 'png' });
+  if (db.prepare('SELECT COUNT(*) c FROM capes WHERE user_id=?').get(req.user.id).c >= 100) return res.status(429).json({ error: 'quota' });
+  const id = crypto.randomBytes(8).toString('hex');
+  fs.writeFileSync(path.join(CAPE_DIR, id + '.png'), buf);
+  db.prepare('INSERT INTO capes(id,user_id,name,created) VALUES(?,?,?,?)').run(id, req.user.id, nm, Date.now());
+  res.json({ ok: true, id });
+});
+app.post('/api/capes/delete', needUser, (req, res) => {
+  const id = String((req.body || {}).id || '');
+  if (!/^[0-9a-f]{16}$/.test(id)) return res.status(400).json({ error: 'invalid' });
+  const r = db.prepare('DELETE FROM capes WHERE id=? AND user_id=?').run(id, req.user.id);
+  if (r.changes) fs.rmSync(path.join(CAPE_DIR, id + '.png'), { force: true });
+  res.json({ ok: r.changes > 0 });
+});
+app.get('/capes/:id.png', (req, res) => {
+  if (!/^[0-9a-f]{16}$/.test(req.params.id)) return res.sendStatus(404);
+  const f = path.join(CAPE_DIR, req.params.id + '.png');
+  if (!fs.existsSync(f)) return res.sendStatus(404);
+  res.set('Content-Type', 'image/png').set('Cache-Control', 'public, max-age=31536000, immutable').sendFile(f);
+});
+
+/* ---- schematics (file + preview picture, shared with everyone) ---- */
+const SCH_EXT = /\.(litematic|schem|schematic|nbt|mcstructure|mcpack|zip)$/i;
+const SCH_MAX = 12 * 1024 * 1024;
+function imgKind(buf) {
+  if (buf.length > 8 && buf.subarray(0, 8).equals(PNG_SIG)) return 'png';
+  if (buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
+  if (buf.length > 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'webp';
+  return null;
+}
+const MIME = { png: 'image/png', jpg: 'image/jpeg', webp: 'image/webp' };
+
+app.get('/api/schematics', (req, res) => {
+  const me = currentUser(req);
+  const rows = db.prepare('SELECT s.id,s.name,s.filename,s.size,s.created,s.user_id,u.nickname FROM schematics s JOIN users u ON u.id=s.user_id ORDER BY s.created ASC').all();
+  res.set('Cache-Control', 'no-store');
+  res.json(rows.map(r => ({ id: r.id, name: r.name, filename: r.filename, size: r.size, created: r.created, by: r.nickname, mine: !!me && me.id === r.user_id })));
+});
+app.post('/api/schematics', limit('sch', 15, 3600e3), needUser, (req, res) => {
+  const { name, filename, file, thumb } = req.body || {};
+  const nm = typeof name === 'string' ? name.replace(/[<>]/g, '').trim().slice(0, 40) : '';
+  const fn = typeof filename === 'string' ? filename.replace(/[^\w.\- ]/g, '_').slice(0, 80) : '';
+  const fm = typeof file === 'string' && /^[A-Za-z0-9+/=]+$/.test(file);
+  const tm = typeof thumb === 'string' && /^data:image\/(?:png|jpeg|webp);base64,([A-Za-z0-9+/=]+)$/.exec(thumb);
+  if (!nm || !fn || !SCH_EXT.test(fn) || !fm || !tm) return res.status(400).json({ error: 'invalid' });
+  const fbuf = Buffer.from(file, 'base64'), tbuf = Buffer.from(tm[1], 'base64');
+  if (fbuf.length < 8 || fbuf.length > SCH_MAX) return res.status(413).json({ error: 'size' });
+  const kind = imgKind(tbuf);
+  if (!kind || tbuf.length > 1024 * 1024) return res.status(400).json({ error: 'thumb' });
+  if (db.prepare('SELECT COUNT(*) c FROM schematics WHERE user_id=?').get(req.user.id).c >= 30) return res.status(429).json({ error: 'quota' });
+  const id = crypto.randomBytes(8).toString('hex');
+  fs.writeFileSync(path.join(SCH_DIR, id + '.bin'), fbuf);
+  fs.writeFileSync(path.join(SCH_DIR, id + '.' + kind), tbuf);
+  db.prepare('INSERT INTO schematics(id,user_id,name,filename,thumb_ext,size,created) VALUES(?,?,?,?,?,?,?)').run(id, req.user.id, nm, fn, kind, fbuf.length, Date.now());
+  res.json({ ok: true, id });
+});
+app.post('/api/schematics/delete', needUser, (req, res) => {
+  const id = String((req.body || {}).id || '');
+  if (!/^[0-9a-f]{16}$/.test(id)) return res.status(400).json({ error: 'invalid' });
+  const row = db.prepare('SELECT thumb_ext FROM schematics WHERE id=? AND user_id=?').get(id, req.user.id);
+  if (!row) return res.json({ ok: false });
+  db.prepare('DELETE FROM schematics WHERE id=?').run(id);
+  fs.rmSync(path.join(SCH_DIR, id + '.bin'), { force: true });
+  fs.rmSync(path.join(SCH_DIR, id + '.' + row.thumb_ext), { force: true });
+  res.json({ ok: true });
+});
+app.get('/schematics/:id.png', (req, res) => {
+  if (!/^[0-9a-f]{16}$/.test(req.params.id)) return res.sendStatus(404);
+  const row = db.prepare('SELECT thumb_ext FROM schematics WHERE id=?').get(req.params.id);
+  if (!row) return res.sendStatus(404);
+  res.set('Content-Type', MIME[row.thumb_ext]).set('Cache-Control', 'public, max-age=31536000, immutable')
+    .sendFile(path.join(SCH_DIR, req.params.id + '.' + row.thumb_ext));
+});
+app.get('/schematics/:id.bin', (req, res) => {
+  if (!/^[0-9a-f]{16}$/.test(req.params.id)) return res.sendStatus(404);
+  const f = path.join(SCH_DIR, req.params.id + '.bin');
+  if (!fs.existsSync(f)) return res.sendStatus(404);
+  res.set('Content-Type', 'application/octet-stream').set('Cache-Control', 'public, max-age=31536000, immutable').sendFile(f);
+});
+
+/* ---- the site itself ---- */
+app.use(express.static(path.join(__dirname, 'public'), { index: 'index.html', dotfiles: 'ignore' }));
+
+setInterval(() => db.prepare('DELETE FROM sessions WHERE expires<?').run(Date.now()), 3600e3).unref();
+app.listen(PORT, () => console.log('BrineMC on http://localhost:' + PORT));
