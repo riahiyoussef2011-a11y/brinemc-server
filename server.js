@@ -111,11 +111,13 @@ function needUser(req, res, next) {
   if (!u) return res.status(401).json({ error: 'auth' });
   req.user = u; next();
 }
+/* Extra allowed origins (e.g. the Netlify site), comma-separated in ALLOWED_ORIGINS */
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(x => x.trim().replace(/\/$/, '')).filter(Boolean);
 /* CSRF: state-changing requests must come from our own origin */
 app.use((req, res, next) => {
   if (req.method === 'GET' || req.method === 'HEAD') return next();
   const o = req.get('origin');
-  if (o) { try { if (new URL(o).host !== req.get('host')) return res.status(403).json({ error: 'origin' }); } catch (e) { return res.status(403).json({ error: 'origin' }); } }
+  if (o) { try { if (new URL(o).host !== req.get('host') && !ALLOWED_ORIGINS.includes(o)) return res.status(403).json({ error: 'origin' }); } catch (e) { return res.status(403).json({ error: 'origin' }); } }
   next();
 });
 function nickOk(n) { return typeof n === 'string' && NICK_RE.test(n) && !RESERVED.has(n.toLowerCase()); }
